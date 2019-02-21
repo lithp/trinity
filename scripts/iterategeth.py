@@ -271,6 +271,8 @@ def bins(args):
         leaves, branches, extensions = 0, 0, 0
         leaf_weight, other_weight = 0, 0
 
+        start = time.monotonic()
+
         for node in traverse_prefix(db, root, prefix):
             if node.kind == 'branch':
                 branches += 1
@@ -282,7 +284,9 @@ def bins(args):
                 extensions += 1
                 other_weight += len(node.rlp)
 
-        print(f'{format_path(prefix)} leaves={leaves} other={branches+extensions} leaf_bytes={leaf_weight} other_bytes={other_weight}')
+        end = time.monotonic()
+
+        print(f'{format_path(prefix)} leaves={leaves} other={branches+extensions} leaf_bytes={leaf_weight} other_bytes={other_weight} secs={end-start}')
 
 
 if __name__ == '__main__':
