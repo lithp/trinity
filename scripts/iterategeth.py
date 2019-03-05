@@ -149,7 +149,8 @@ def open_db(path):
         path,
         create_if_missing=False,
         error_if_exists=False,
-        max_open_files=64
+        max_open_files=64,
+        block_size=1024,
     )
 
 
