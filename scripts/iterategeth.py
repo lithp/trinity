@@ -327,6 +327,43 @@ def find_storage_roots(args):
         print(f'{format_path(prefix)} storage={with_storage} nostorage={total-with_storage} secs={time_taken}')
 
 
+def traverse_all(db, root):
+    for node in traverse_node(db, tuple(), root, [0]):
+        yield node
+
+
+def inspect_storage(args):
+    '''
+    find_storage_roots creates a file of (account, storage_root) tuples. However, many of
+    those are duplicates! To create a file which can be passed to inspect_storage, you
+    should probably run: `cut -d' ' -f2 [file] | sort | uniq`
+
+    {args.file}
+
+    args.file has a list of storage roots
+    iterate over each root and print some statistics!
+    '''
+    db = open_db(args.db)
+
+    roots = [bytes.fromhex(line.strip()) for line in args.file]
+
+    for i, root in enumerate(roots):
+        start = time.monotonic()
+
+        leaves, others, leaf_bytes, other_bytes = 0, 0, 0, 0
+
+        for node in traverse_all(db, root):
+            if node.kind == 'leaf':
+                leaves += 1
+                leaf_bytes += len(node.rlp)
+            else:
+                others += 1
+                other_bytes += len(node.rlp)
+
+        time_taken = time.monotonic() - start
+        print(f'root={root.hex()} leaves={leaves} others={others} leaf_bytes={leaf_bytes} other_bytes={other_bytes} secs={time_taken}')
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('-db', type=str, required=True)
@@ -354,6 +391,10 @@ if __name__ == '__main__':
     parser_states = subparsers.add_parser('find_storage_roots')
     parser_states.set_defaults(func=find_storage_roots)
     parser_states.add_argument('-dest', type=argparse.FileType('w'), required=True)
+
+    look_at_roots = subparsers.add_parser('inspect_storage')
+    look_at_roots.set_defaults(func=inspect_storage)
+    look_at_roots.add_argument('-file', type=argparse.FileType('r'), required=True)
 
     args = parser.parse_args()
     args.func(args)
