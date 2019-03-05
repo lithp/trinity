@@ -312,6 +312,8 @@ def find_storage_roots(args):
     for prefix in prefixes:
         total, with_storage = 0, 0
 
+        start = time.monotonic()
+
         for node in traverse_prefix(db, root, prefix):
             if node.kind == 'leaf':
                 total += 1
@@ -320,7 +322,9 @@ def find_storage_roots(args):
                     with_storage += 1
                     args.dest.write(f'{format_path(node.path)} {account.storage_root.hex()}\n')
 
-        print(f'{format_path(prefix)} storage={with_storage} nostorage={total-with_storage}')
+        time_taken = time.monotonic() - start
+
+        print(f'{format_path(prefix)} storage={with_storage} nostorage={total-with_storage} secs={time_taken}')
 
 
 if __name__ == '__main__':
