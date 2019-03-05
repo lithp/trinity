@@ -10,6 +10,7 @@ import rlp
 
 from eth_utils import toolz
 
+from eth.constants import BLANK_ROOT_HASH
 from eth.rlp.accounts import Account
 from eth.rlp.headers import BlockHeader
 from trie.constants import (
@@ -250,6 +251,12 @@ def traverse_prefix(db, root, prefix):
             break
 
 
+def all_prefixes(depth, count):
+    prefixes = itertools.product(*(range(16) for _ in range(depth)))
+    prefixes = itertools.islice(prefixes, count)
+    return list(prefixes)
+
+
 def bins(args):
     """
     Build chunks and print summaries for each of them.
@@ -260,12 +267,10 @@ def bins(args):
 
     It will also print the size of the proof-chunk (0 if the depth is 1)
     """
-    prefixes = itertools.product(*(range(16) for _ in range(args.depth)))
-    prefixes = itertools.islice(prefixes, args.count)
-    prefixes = list(prefixes)
 
     db = open_db(args.db)
     root = state_root_for(args, db)
+    prefixes = all_prefixes(args.depth, args.count)
 
     for prefix in prefixes:
         leaves, branches, extensions = 0, 0, 0
@@ -287,6 +292,34 @@ def bins(args):
         end = time.monotonic()
 
         print(f'{format_path(prefix)} leaves={leaves} other={branches+extensions} leaf_bytes={leaf_weight} other_bytes={other_weight} secs={end-start}')
+
+
+def account_for_leaf(leaf):
+    node = decode_node(leaf)
+    account_rlp = node[1]
+    return rlp.decode(account_rlp, sedes=Account)
+
+
+def find_storage_roots(args):
+    '''
+    Iterate over all accounts and log the accounts which have a storage root
+    '''
+    db = open_db(args.db)
+    root = state_root_for(args, db)
+    prefixes = all_prefixes(4, None)
+
+    for prefix in prefixes:
+        total, with_storage = 0, 0
+
+        for node in traverse_prefix(db, root, prefix):
+            if node.kind == 'leaf':
+                total += 1
+                account = account_for_leaf(node.rlp)
+                if account.storage_root != BLANK_ROOT_HASH:
+                    with_storage += 1
+                    args.dest.write(f'{format_path(node.path)} {account.storage_root.hex()}\n')
+
+        print(f'{format_path(prefix)} storage={with_storage} nostorage={total-with_storage}')
 
 
 if __name__ == '__main__':
@@ -311,6 +344,11 @@ if __name__ == '__main__':
     parser_bins.add_argument('-depth', type=int, required=True)
     parser_bins.add_argument('-count', type=int, required=False)
     parser_bins.add_argument('-prefix', type=str, required=False)
+
+    # find all the accounts with storage
+    parser_states = subparsers.add_parser('find_storage_roots')
+    parser_states.set_defaults(func=find_storage_roots)
+    parser_states.add_argument('-dest', type=argparse.FileType('w'), required=True)
 
     args = parser.parse_args()
     args.func(args)
