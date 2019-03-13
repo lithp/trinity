@@ -5,6 +5,7 @@ import datetime
 import functools
 import logging
 import operator
+import secrets
 import struct
 from abc import (
     ABC,
@@ -33,6 +34,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.constant_time import bytes_eq
 
 from eth_utils import (
+    big_endian_to_int,
     to_tuple,
 )
 
@@ -58,6 +60,7 @@ from p2p.exceptions import (
     UnknownProtocolCommand,
     UnreachablePeer,
 )
+from p2p.kademlia import Address
 from p2p.service import BaseService
 from p2p._utils import (
     get_devp2p_cmd_id,
@@ -76,6 +79,8 @@ from p2p.p2p_proto import (
 
 from .constants import (
     CONN_IDLE_TIMEOUT,
+    ENCRYPTED_AUTH_MSG_LEN,
+    HASH_LEN,
     HEADER_LEN,
     MAC_LEN,
     SNAPPY_PROTOCOL_VERSION,
@@ -137,6 +142,69 @@ async def handshake(remote: Node, factory: 'BasePeerFactory') -> 'BasePeer':
         raise
 
     return peer
+
+
+async def receive_handshake(privkey: datatypes.PrivateKey,
+                            reader: asyncio.StreamReader,
+                            writer: asyncio.StreamWriter) -> None:
+    logger = logging.getLogger('p2p.peer.receive_handshake')
+
+    # TODO: add a timeout here!
+    msg = await reader.read(ENCRYPTED_AUTH_MSG_LEN)
+
+    ip, socket, *_ = writer.get_extra_info("peername")
+    remote_address = Address(ip, socket)
+    logger.debug("Receiving handshake from %s", remote_address)
+
+    got_eip8 = False
+    try:
+        ephem_pubkey, initiator_nonce, initiator_pubkey = auth.decode_authentication(
+            msg, privkey
+        )
+    except DecryptionError:
+        # Try to decode as EIP8
+        got_eip8 = True
+        msg_size = big_endian_to_int(msg[:2])
+        remaining_bytes = msg_size - ENCRYPTED_AUTH_MSG_LEN + 2
+        # TODO: add a timeout here!
+        msg += await reader.read(remaining_bytes)
+        try:
+            ephem_pubkey, initiator_nonce, initiator_pubkey = auth.decode_authentication(
+                msg, privkey
+            )
+        except DecryptionError as e:
+            logger.debug("Failed to decrypt handshake: %s", e)
+            return
+
+    initiator_remote = Node(initiator_pubkey, remote_address)
+    responder = auth.HandshakeResponder(initiator_remote, privkey, got_eip8)
+
+    responder_nonce = secrets.token_bytes(HASH_LEN)
+    auth_ack_msg = responder.create_auth_ack_message(responder_nonce)
+    auth_ack_ciphertext = responder.encrypt_auth_ack_message(auth_ack_msg)
+
+    # Use the `writer` to send the reply to the remote
+    writer.write(auth_ack_ciphertext)
+    await writer.drain()
+
+    # Call `HandshakeResponder.derive_shared_secrets()` and use return values to create `Peer`
+    aes_secret, mac_secret, egress_mac, ingress_mac = responder.derive_secrets(
+        initiator_nonce=initiator_nonce,
+        responder_nonce=responder_nonce,
+        remote_ephemeral_pubkey=ephem_pubkey,
+        auth_init_ciphertext=msg,
+        auth_ack_ciphertext=auth_ack_ciphertext
+    )
+    connection = PeerConnection(
+        reader=reader,
+        writer=writer,
+        aes_secret=aes_secret,
+        mac_secret=mac_secret,
+        egress_mac=egress_mac,
+        ingress_mac=ingress_mac,
+    )
+
+    return initiator_remote, connection
 
 
 class PeerConnection(NamedTuple):

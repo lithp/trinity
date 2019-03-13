@@ -38,7 +38,7 @@ from p2p.nat import UPnPService
 from p2p.p2p_proto import (
     DisconnectReason,
 )
-from p2p.peer import BasePeer, PeerConnection
+from p2p.peer import BasePeer, PeerConnection, receive_handshake
 from p2p.persistence import BasePeerInfo
 from p2p.service import BaseService
 
@@ -180,58 +180,10 @@ class BaseServer(BaseService, Generic[TPeerPool]):
 
     async def _receive_handshake(
             self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        msg = await self.wait(
-            reader.read(ENCRYPTED_AUTH_MSG_LEN),
-            timeout=REPLY_TIMEOUT)
 
-        ip, socket, *_ = writer.get_extra_info("peername")
-        remote_address = Address(ip, socket)
-        self.logger.debug("Receiving handshake from %s", remote_address)
-        got_eip8 = False
-        try:
-            ephem_pubkey, initiator_nonce, initiator_pubkey = decode_authentication(
-                msg, self.privkey)
-        except DecryptionError:
-            # Try to decode as EIP8
-            got_eip8 = True
-            msg_size = big_endian_to_int(msg[:2])
-            remaining_bytes = msg_size - ENCRYPTED_AUTH_MSG_LEN + 2
-            msg += await self.wait(
-                reader.read(remaining_bytes),
-                timeout=REPLY_TIMEOUT)
-            try:
-                ephem_pubkey, initiator_nonce, initiator_pubkey = decode_authentication(
-                    msg, self.privkey)
-            except DecryptionError as e:
-                self.logger.debug("Failed to decrypt handshake: %s", e)
-                return
-
-        initiator_remote = Node(initiator_pubkey, remote_address)
-        responder = HandshakeResponder(initiator_remote, self.privkey, got_eip8)
-
-        responder_nonce = secrets.token_bytes(HASH_LEN)
-        auth_ack_msg = responder.create_auth_ack_message(responder_nonce)
-        auth_ack_ciphertext = responder.encrypt_auth_ack_message(auth_ack_msg)
-
-        # Use the `writer` to send the reply to the remote
-        writer.write(auth_ack_ciphertext)
-        await self.wait(writer.drain())
-
-        # Call `HandshakeResponder.derive_shared_secrets()` and use return values to create `Peer`
-        aes_secret, mac_secret, egress_mac, ingress_mac = responder.derive_secrets(
-            initiator_nonce=initiator_nonce,
-            responder_nonce=responder_nonce,
-            remote_ephemeral_pubkey=ephem_pubkey,
-            auth_init_ciphertext=msg,
-            auth_ack_ciphertext=auth_ack_ciphertext
-        )
-        connection = PeerConnection(
-            reader=reader,
-            writer=writer,
-            aes_secret=aes_secret,
-            mac_secret=mac_secret,
-            egress_mac=egress_mac,
-            ingress_mac=ingress_mac,
+        # TOOD: add a self.wait here!
+        initiator_remote, connection = await receive_handshake(
+            self.privkey, reader, writer
         )
 
         # Create and register peer in peer_pool
