@@ -1,5 +1,7 @@
 import argparse
+from collections import defaultdict
 import itertools
+import random
 import plyvel
 import struct
 import sys
@@ -38,6 +40,7 @@ class Node(typing.NamedTuple):
     kind: str
     rlp: bytes
     path: tuple
+    depth: int
 
 
 # from https://github.com/ethereum/go-ethereum/blob/master/core/rawdb/schema.go
@@ -64,7 +67,7 @@ def get_node(db, nodehash):
     return node_rlp, node
 
 
-def traverse_branch(db, path, branch, start):
+def traverse_branch(db, path, branch, start, depth):
     if branch[16] != b'':
         print(f'weird branch: {path} {branch}')
         raise Exception('weird branch')
@@ -77,7 +80,9 @@ def traverse_branch(db, path, branch, start):
 
     for i in range(start_index, 16):
         if branch[i] != b'':
-            yield from traverse_node(db, path + (i,), branch[i], start[1:])
+            yield from traverse_node(
+                db, path + (i,), branch[i], start[1:], depth
+            )
 
 
 def format_path(path) -> str:
@@ -87,23 +92,23 @@ def format_path(path) -> str:
     )
 
 
-def traverse_node(db, path, nodehash, start: int):
+def traverse_node(db, path, nodehash, start, depth=0):
     node_rlp, node = get_node(db, nodehash)
     node_type = get_node_type(node)
     if node_type == NODE_TYPE_BRANCH:
-        yield Node('branch', node_rlp, path)
-        yield from traverse_branch(db, path, node, start)
+        yield Node('branch', node_rlp, path, depth)
+        yield from traverse_branch(db, path, node, start, depth+1)
     elif node_type == NODE_TYPE_LEAF:
         rest = extract_key(node)
         # TODO: also traverse the state root?
-        yield Node('leaf', node_rlp, path + rest)
+        yield Node('leaf', node_rlp, path + rest, depth)
     elif node_type == NODE_TYPE_EXTENSION:
         # TODO: decide whether to yield this node, does it still match {start}
         # TODO: test that we're building this path correctly
         rest = extract_key(node)
         full_path = path + rest
-        yield Node('extension', node_rlp, full_path)
-        yield from traverse_node(db, full_path, node[1], start[1:])
+        yield Node('extension', node_rlp, full_path, depth)
+        yield from traverse_node(db, full_path, node[1], start[1:], depth+1)
     else:
         raise Exception(f"don't know how to handle type {node_type}")
 
@@ -364,6 +369,41 @@ def inspect_storage(args):
         print(f'root={root.hex()} leaves={leaves} others={others} leaf_bytes={leaf_bytes} other_bytes={other_bytes} secs={time_taken}')
 
 
+def level_weights(args):
+    """
+    Picks a random bin and iterates over all the nodes:
+    - How many bytes are at each depth?
+    - Which depths are each leaf at?
+    """
+    db = open_db(args.db)
+    root = state_root_for(args, db)
+
+    prefixes = all_prefixes(args.depth, None)
+    prefix = random.choice(prefixes)
+
+    print(f'iterating over all nodes with prefix: {format_path(prefix)}')
+
+    level_other_weight = defaultdict(int)
+    level_other_count = defaultdict(int)
+    level_leaf_weight = defaultdict(int)
+    level_leaf_count = defaultdict(int)
+    for node in traverse_prefix(db, root, prefix):
+        if node.kind == 'leaf':
+            level_leaf_count[node.depth] += 1
+            level_leaf_weight[node.depth] += len(node.rlp)
+        else:
+            level_other_count[node.depth] += 1
+            level_other_weight[node.depth] += len(node.rlp)
+
+    max_depth = max(list(level_other_count.keys()) + list(level_leaf_count.keys()))
+    for i in range(max_depth+1):
+        leaf_count = level_leaf_count.get(i, 0)
+        other_count = level_other_count.get(i, 0)
+        leaf_bytes = level_leaf_weight.get(i, 0)
+        other_bytes = level_other_weight.get(i, 0)
+        print(f'depth={i} leaf_bytes={leaf_bytes} other_bytes={other_bytes} leaf_count={leaf_count} other_count={other_count}')
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('-db', type=str, required=True)
@@ -395,6 +435,11 @@ if __name__ == '__main__':
     look_at_roots = subparsers.add_parser('inspect_storage')
     look_at_roots.set_defaults(func=inspect_storage)
     look_at_roots.add_argument('-file', type=argparse.FileType('r'), required=True)
+
+    # measure depth
+    level_weights_p = subparsers.add_parser('level_weights')
+    level_weights_p.set_defaults(func=level_weights)
+    level_weights_p.add_argument('-depth', type=int, required=True)
 
     args = parser.parse_args()
     args.func(args)
