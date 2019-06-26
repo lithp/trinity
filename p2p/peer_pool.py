@@ -80,6 +80,8 @@ from p2p.tracking.connection import (
     NoopConnectionTracker,
 )
 
+from trinity import metrics
+
 
 TO_DISCOVERY_BROADCAST_CONFIG = BroadcastConfig(filter_endpoint=DISCOVERY_EVENTBUS_ENDPOINT)
 
@@ -283,6 +285,8 @@ class BasePeerPool(BaseService, AsyncIterable[BasePeer]):
             for msg in msgs:
                 subscriber.add_msg(msg)
 
+        metrics.gauge('pool.connected_peers', len(self.connected_nodes))
+
     async def _run(self) -> None:
         # FIXME: PeerPool should probably no longer be a BaseService, but for now we're keeping it
         # so in order to ensure we cancel all peers when we terminate.
@@ -326,9 +330,10 @@ class BasePeerPool(BaseService, AsyncIterable[BasePeer]):
             raise IneligiblePeer(f"Peer database rejected peer candidate: {remote}")
 
         try:
-            self.logger.debug2("Connecting to %s...", remote)
+            self.logger.debug("Connecting to %s...", remote)
             # We use self.wait() as well as passing our CancelToken to handshake() as a workaround
             # for https://github.com/ethereum/py-evm/issues/670.
+            metrics.count('pool.handshake_attempts')
             peer = await self.wait(handshake(remote, self.get_peer_factory()))
 
             return peer
@@ -402,6 +407,11 @@ class BasePeerPool(BaseService, AsyncIterable[BasePeer]):
 
         try:
             async with self._connection_attempt_lock:
+                attempt_count = (
+                    MAX_CONCURRENT_CONNECTION_ATTEMPTS
+                    - self._connection_attempt_lock._value
+                )
+                metrics.gauge('pool.concurrent_connection_attempts', attempt_count)
                 peer = await self.connect(node)
         except ALLOWED_PEER_CONNECTION_EXCEPTIONS:
             return
@@ -444,6 +454,8 @@ class BasePeerPool(BaseService, AsyncIterable[BasePeer]):
         for subscriber in self._subscribers:
             subscriber.deregister_peer(peer)
 
+        metrics.gauge('pool.connected_peers', len(self.connected_nodes))
+
     async def __aiter__(self) -> AsyncIterator[BasePeer]:
         for peer in tuple(self.connected_nodes.values()):
             # Yield control to ensure we process any disconnection requests from peers. Otherwise
@@ -482,4 +494,5 @@ class BasePeerPool(BaseService, AsyncIterable[BasePeer]):
                 for line in peer.get_extra_stats():
                     self.logger.debug("    %s", line)
             self.logger.debug("== End peer details == ")
+
             await self.sleep(self._report_interval)

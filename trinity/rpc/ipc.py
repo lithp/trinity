@@ -23,6 +23,8 @@ from trinity.rpc.main import (
     RPCServer,
 )
 
+from lahja import BaseEvent
+
 MAXIMUM_REQUEST_BYTES = 10000
 
 

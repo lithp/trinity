@@ -62,6 +62,8 @@ from trinity._utils.shutdown import (
     exit_with_endpoint_and_services,
 )
 
+from trinity import metrics
+
 
 def get_protocol(trinity_config: TrinityConfig) -> Type[Protocol]:
     # For now DiscoveryByTopicProtocol supports a single topic, so we use the latest
@@ -102,6 +104,17 @@ class DiscoveryBootstrapService(BaseService):
         self.event_bus = event_bus
         self.trinity_config = trinity_config
 
+    async def report_metrics(self, protocol) -> None:
+        while not self.cancel_token.triggered:
+
+            table = protocol.routing
+            bonded_nodes = 0
+            for bucket in table.buckets:
+                bonded_nodes += len(bucket.nodes)
+            metrics.gauge('bonded_nodes', bonded_nodes)
+
+            await asyncio.sleep(1)
+
     async def _run(self) -> None:
         external_ip = "0.0.0.0"
         address = Address(external_ip, self.trinity_config.port, self.trinity_config.port)
@@ -139,6 +152,8 @@ class DiscoveryBootstrapService(BaseService):
                 self.event_bus,
                 self.cancel_token,
             )
+
+        self.run_daemon_task(self.report_metrics(discovery_protocol))
 
         try:
             await discovery_service.run()

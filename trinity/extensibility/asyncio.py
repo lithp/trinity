@@ -1,4 +1,5 @@
 import asyncio
+import os
 
 from lahja import ConnectionConfig
 
@@ -7,6 +8,8 @@ from trinity.extensibility.events import PluginStartedEvent
 from trinity.endpoint import TrinityEventBusEndpoint
 
 from .plugin import BaseIsolatedPlugin
+
+from trinity import metrics
 
 
 class AsyncioIsolatedPlugin(BaseIsolatedPlugin):
@@ -27,6 +30,13 @@ class AsyncioIsolatedPlugin(BaseIsolatedPlugin):
             loop.run_forever()
             loop.close()
 
+    async def _report_tasks(self) -> None:
+        pid = os.getpid()
+        while True:
+            running_tasks = len(asyncio.all_tasks())
+            metrics.gauge(f'plugins.{pid}({self.name}).tasks', running_tasks)
+            await asyncio.sleep(1)
+
     async def _prepare_start(self) -> None:
         connection_config = ConnectionConfig.from_name(
             self.normalized_name,
@@ -45,6 +55,10 @@ class AsyncioIsolatedPlugin(BaseIsolatedPlugin):
         await self.event_bus.broadcast(
             PluginStartedEvent(type(self))
         )
+
+        metrics.set_bus(self.event_bus)
+        self.logger.debug(f'metrics set: {metrics._bus}')
+        asyncio.ensure_future(self._report_tasks())
 
         # Whenever new EventBus Endpoints come up the `main` process broadcasts this event
         # and we connect to every Endpoint directly

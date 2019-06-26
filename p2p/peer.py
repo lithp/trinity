@@ -72,6 +72,8 @@ from .constants import (
     SNAPPY_PROTOCOL_VERSION,
 )
 
+from trinity import metrics
+
 if TYPE_CHECKING:
     from p2p.peer_pool import BasePeerPool  # noqa: F401
 
@@ -384,6 +386,12 @@ class BasePeer(BaseService):
                 cmd,
                 trim_middle(str(decoded_msg), 500),
             )
+
+            remote = self.transport.remote
+            remote_id = remote.pubkey.to_hex()[:6]
+            metrics.count(f'peers.received_msgs')
+            # metrics.count(f'peers.{remote_id}.received_msgs')
+
             self.received_msgs[cmd] += 1
             return cmd, decoded_msg
 

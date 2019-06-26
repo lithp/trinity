@@ -23,6 +23,10 @@ from trinity.plugins.builtin.fix_unclean_shutdown.plugin import (
 from trinity.plugins.builtin.json_rpc.plugin import (
     JsonRpcServerPlugin,
 )
+from trinity.plugins.builtin.metrics.plugin import (
+    MetricsServerPlugin,
+    MetricsPlugin,
+)
 from trinity.plugins.builtin.network_db.plugin import (
     NetworkDBPlugin,
 )
@@ -71,6 +75,8 @@ ETH1_NODE_PLUGINS: Tuple[Type[BasePlugin], ...] = (
     LightPeerChainBridgePlugin,
     SyncerPlugin,
     TxPlugin,
+    MetricsPlugin,
+    MetricsServerPlugin,
 )
 
 

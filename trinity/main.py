@@ -68,6 +68,8 @@ from trinity._utils.shutdown import (
     exit_signal_with_services,
 )
 
+from trinity import metrics
+
 
 def main() -> None:
     main_entry(trinity_boot, APP_IDENTIFIER_ETH1, get_plugins_for_eth1_client(), (Eth1AppConfig,))
@@ -151,6 +153,8 @@ async def launch_node_coro(args: Namespace, trinity_config: TrinityConfig) -> No
             ConnectionConfig.from_name(MAIN_EVENTBUS_ENDPOINT, trinity_config.ipc_dir),
         )
         await endpoint.announce_endpoint()
+
+        metrics.set_bus(endpoint)
 
         # This is a second PluginManager instance governing plugins in a shared process.
         plugin_manager = PluginManager(SharedProcessScope(endpoint), get_plugins_for_eth1_client())
