@@ -182,7 +182,15 @@ class NoMatchingPeerCapabilities(BaseP2PError):
     """
     Raised during primary p2p handshake if there are no common capabilities with a peer.
     """
-    pass
+    def __init__(self, local_capabilities, remote_capabilities) -> None:
+        msg = (
+            "Found no matching capabilities between self and peer:\n"
+            f" - local : {local_capabilities}\n"
+            f" - remote: {remote_capabilities}"
+        )
+        super().__init__(msg, local_capabilities, remote_capabilities)
+        self.local_capabilities = local_capabilities
+        self.remote_capabilities = remote_capabilities
 
 
 class ReceiptNotFound(BaseP2PError):

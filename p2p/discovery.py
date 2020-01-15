@@ -22,7 +22,9 @@ from typing import (
     Set,
     Tuple,
     TYPE_CHECKING,
+    Optional,
 )
+import itertools
 
 import trio
 
@@ -119,22 +121,21 @@ CMD_NEIGHBOURS = DiscoveryCommand("neighbours", 4, 2)
 CMD_ID_MAP = dict((cmd.id, cmd) for cmd in [CMD_PING, CMD_PONG, CMD_FIND_NODE, CMD_NEIGHBOURS])
 
 
-class DiscoveryService(Service):
-    _refresh_interval: int = 30
+def _mkpingid(token: Hash32, node: NodeAPI) -> Hash32:
+    return Hash32(token + node.pubkey.to_bytes())
+
+
+class DiscoveryProtocol(Service):
     _max_neighbours_per_packet_cache = None
 
-    logger = get_extended_debug_logger('p2p.discovery.DiscoveryService')
+    logger = get_extended_debug_logger('p2p.discovery.DiscoveryProtocol')
 
     def __init__(self,
                  privkey: datatypes.PrivateKey,
                  address: AddressAPI,
-                 bootstrap_nodes: Sequence[NodeAPI],
-                 event_bus: EndpointAPI,
                  socket: trio.socket.SocketType) -> None:
         self.privkey = privkey
         self.address = address
-        self.bootstrap_nodes = bootstrap_nodes
-        self._event_bus = event_bus
         self.this_node = Node(self.pubkey, address)
         self.routing = RoutingTable(self.this_node)
         self.pong_callbacks = CallbackManager()
@@ -151,38 +152,9 @@ class DiscoveryService(Service):
         while self.manager.is_running:
             await self.consume_datagram()
 
-    async def handle_get_peer_candidates_requests(self) -> None:
-        async for event in self._event_bus.stream(PeerCandidatesRequest):
-            nodes = tuple(self.get_nodes_to_connect(event.max_candidates))
-            self.logger.debug2("Broadcasting peer candidates (%s)", nodes)
-            await self._event_bus.broadcast(
-                event.expected_response_type()(nodes),
-                event.broadcast_config()
-            )
-
-    async def handle_get_random_bootnode_requests(self) -> None:
-        async for event in self._event_bus.stream(RandomBootnodeRequest):
-
-            nodes = tuple(self.get_random_bootnode())
-
-            self.logger.debug2("Broadcasting random boot nodes (%s)", nodes)
-            await self._event_bus.broadcast(
-                event.expected_response_type()(nodes),
-                event.broadcast_config()
-            )
-
     async def run(self) -> None:
-        self.manager.run_daemon_task(self.handle_get_peer_candidates_requests)
-        self.manager.run_daemon_task(self.handle_get_random_bootnode_requests)
-        self.manager.run_daemon_task(self.periodically_refresh)
-
         self.manager.run_daemon_task(self.consume_datagrams)
-        self.manager.run_task(self.bootstrap)
         await self.manager.wait_finished()
-
-    async def periodically_refresh(self) -> None:
-        async for _ in trio_utils.every(self._refresh_interval):
-            await self.lookup_random()
 
     def update_routing_table(self, node: NodeAPI) -> None:
         """Update the routing table entry for the given node."""
@@ -268,7 +240,7 @@ class DiscoveryService(Service):
         is set or a timeout (k_request_timeout) occurs. At that point it returns whether or not
         a pong was received with the given pingid.
         """
-        pingid = self._mkpingid(token, remote)
+        pingid = _mkpingid(token, remote)
 
         with self.pong_callbacks.acquire(pingid, callback):
             with trio.move_on_after(constants.KADEMLIA_REQUEST_TIMEOUT) as cancel_scope:
@@ -315,9 +287,6 @@ class DiscoveryService(Service):
 
         return tuple(n for n in neighbours if n != self.this_node)
 
-    def _mkpingid(self, token: Hash32, node: NodeAPI) -> Hash32:
-        return Hash32(token + node.pubkey.to_bytes())
-
     def _send_find_node(self, node: NodeAPI, target_node_id: int) -> None:
         self.send_find_node_v4(node, target_node_id)
 
@@ -356,8 +325,8 @@ class DiscoveryService(Service):
         closest = self.routing.neighbours(node_id)
         self.logger.debug("starting lookup; initial neighbours: %s", closest)
         nodes_to_ask = _exclude_if_asked(closest)
-        while nodes_to_ask:
-            self.logger.debug2("node lookup; querying %s", nodes_to_ask)
+        for i in itertools.count():
+            self.logger.debug("node lookup (%s); querying %s", i, nodes_to_ask)
             nodes_asked.update(nodes_to_ask)
             next_find_node_queries = (
                 (_find_node, node_id, n)
@@ -371,6 +340,9 @@ class DiscoveryService(Service):
             closest = sort_by_distance(closest, node_id)[:constants.KADEMLIA_BUCKET_SIZE]
             nodes_to_ask = _exclude_if_asked(closest)
 
+            if not nodes_to_ask:
+                break
+
         self.logger.debug(
             "lookup finished for target %s; closest neighbours: %s", to_hex(node_id), closest
         )
@@ -378,15 +350,6 @@ class DiscoveryService(Service):
 
     async def lookup_random(self) -> Tuple[NodeAPI, ...]:
         return await self.lookup(random.randint(0, constants.KADEMLIA_MAX_NODE_ID))
-
-    def get_random_bootnode(self) -> Iterator[NodeAPI]:
-        if self.bootstrap_nodes:
-            yield random.choice(self.bootstrap_nodes)
-        else:
-            self.logger.warning('No bootnodes available')
-
-    def get_nodes_to_connect(self, count: int) -> Iterator[NodeAPI]:
-        return self.routing.get_random_nodes(count)
 
     @property
     def pubkey(self) -> datatypes.PublicKey:
@@ -411,8 +374,8 @@ class DiscoveryService(Service):
         cls._max_neighbours_per_packet_cache = _get_max_neighbours_per_packet()
         return cls._max_neighbours_per_packet_cache
 
-    async def bootstrap(self) -> None:
-        for node in self.bootstrap_nodes:
+    async def bootstrap(self, bootstrap_nodes) -> None:
+        for node in bootstrap_nodes:
             uri = node.uri()
             pubkey, _, uri_tail = uri.partition('@')
             pubkey_head = pubkey[:16]
@@ -423,12 +386,12 @@ class DiscoveryService(Service):
         bonding_queries = (
             (self.bond, n)
             for n
-            in self.bootstrap_nodes
+            in bootstrap_nodes
             if (not self.ping_callbacks.locked(n) and not self.pong_callbacks.locked(n))
         )
         bonded = await trio_utils.gather(*bonding_queries)
         if not any(bonded):
-            self.logger.info("Failed to bond with bootstrap nodes %s", self.bootstrap_nodes)
+            self.logger.info("Failed to bond with bootstrap nodes %s", bootstrap_nodes)
             return
         await self.lookup_random()
 
@@ -572,7 +535,7 @@ class DiscoveryService(Service):
             self.parity_pong_tokens = eth_utils.toolz.valfilter(
                 lambda val: val != token, self.parity_pong_tokens)
 
-        pingid = self._mkpingid(token, remote)
+        pingid = _mkpingid(token, remote)
 
         try:
             callback = self.pong_callbacks.get_callback(pingid)
@@ -602,6 +565,65 @@ class DiscoveryService(Service):
             pass
         else:
             callback()
+
+
+class DiscoveryService(Service):
+    _refresh_interval: int = 30
+
+    logger = get_extended_debug_logger('p2p.discovery.DiscoveryService')
+
+    def __init__(self,
+                 privkey: datatypes.PrivateKey,
+                 address: AddressAPI,
+                 bootstrap_nodes: Sequence[NodeAPI],
+                 event_bus: EndpointAPI,
+                 socket: trio.socket.SocketType) -> None:
+        self.bootstrap_nodes = bootstrap_nodes
+        self._event_bus = event_bus
+
+        self.protocol = DiscoveryProtocol(privkey, address, socket)
+
+    async def handle_get_peer_candidates_requests(self) -> None:
+        async for event in self._event_bus.stream(PeerCandidatesRequest):
+            nodes = tuple(self.get_nodes_to_connect(event.max_candidates))
+            self.logger.debug2("Broadcasting peer candidates (%s)", nodes)
+            await self._event_bus.broadcast(
+                event.expected_response_type()(nodes),
+                event.broadcast_config()
+            )
+
+    async def handle_get_random_bootnode_requests(self) -> None:
+        async for event in self._event_bus.stream(RandomBootnodeRequest):
+
+            nodes = tuple(self.get_random_bootnode())
+
+            self.logger.debug2("Broadcasting random boot nodes (%s)", nodes)
+            await self._event_bus.broadcast(
+                event.expected_response_type()(nodes),
+                event.broadcast_config()
+            )
+
+    async def run(self) -> None:
+        self.manager.run_daemon_task(self.handle_get_peer_candidates_requests)
+        self.manager.run_daemon_task(self.handle_get_random_bootnode_requests)
+        self.manager.run_daemon_task(self.periodically_refresh)
+
+        self.manager.run_daemon_task(self.protocol)
+        self.manager.run_task(self.protocol.bootstrap, self.bootstrap_nodes)
+        await self.manager.wait_finished()
+
+    async def periodically_refresh(self) -> None:
+        async for _ in trio_utils.every(self._refresh_interval):
+            await self.protocol.lookup_random()
+
+    def get_random_bootnode(self) -> Iterator[NodeAPI]:
+        if self.bootstrap_nodes:
+            yield random.choice(self.bootstrap_nodes)
+        else:
+            self.logger.warning('No bootnodes available')
+
+    def get_nodes_to_connect(self, count: int) -> Iterator[NodeAPI]:
+        return self.protocol.routing.get_random_nodes(count)
 
 
 class PreferredNodeDiscoveryService(DiscoveryService):

@@ -242,9 +242,8 @@ async def negotiate_protocol_handshakes(transport: TransportAPI,
     # If there are no capability matches throw an exception.
     if len(selected_capabilities) < 1:
         raise NoMatchingPeerCapabilities(
-            "Found no matching capabilities between self and peer:\n"
-            f" - local : {tuple(sorted(local_capabilities))}\n"
-            f" - remote: {devp2p_receipt.capabilities}"
+            tuple(sorted(local_capabilities)),
+            devp2p_receipt.capabilities,
         )
 
     # Retrieve the handshakers which correspond to the selected protocols.
@@ -325,7 +324,7 @@ async def dial_out(remote: NodeAPI,
         # reader/writer connection pair in the event of an error during the
         # peer connection and handshake process.
         # See `p2p.auth.handshake` for the other.
-        transport.close()
+        await transport.close()
         await asyncio.sleep(0)
         raise
 
