@@ -385,6 +385,7 @@ def should_connect(conn, node):
 class PeerCountTracker:
     def __init__(self):
         self.peer_count = 0
+        self.peer_disconnected_event = asyncio.Event()
 
     @contextlib.contextmanager
     def track(self, remote) -> None:
@@ -394,6 +395,7 @@ class PeerCountTracker:
             yield
         finally:
             self.peer_count -= 1
+            self.peer_disconnected_event.set()
             logger.info(f'disconnected. remote={remote} peer_count={self.peer_count}')
 
 
@@ -421,6 +423,16 @@ async def connect_from_queue(engine, candidate_enode_queue, peer_tracker, gethdb
     conn = engine.connect()
     try:
         while True:
+            # if we connect to too many remotes then the event loop gets bogged down
+            while peer_tracker.peer_count >= 80:
+                await peer_tracker.peer_disconnected_event.wait()
+                if not peer_tracker.peer_disconnected_event.is_set():
+                    # another coro woke up before this one
+                    continue
+                # this coro woke first, signal to the others that they're too late
+                peer_tracker.peer_disconnected_event.clear()
+                break
+
             node = await candidate_enode_queue.get()
 
             if should_connect(conn, node):
@@ -460,7 +472,7 @@ async def connect_all(enode_file_name, gethdb):
 
         feeder = asyncio.ensure_future(feed_queue(queue, enode_file_name))
         readers = []
-        for _ in range(2):
+        for _ in range(20):
             readers.append(
                 asyncio.ensure_future(connect_from_queue(engine, queue, tracker, gethdb))
             )
@@ -666,6 +678,9 @@ async def process(connection, gethdb):
                     f'hash={new_block_hash.hash.hex()} '
                     f'blocknum={new_block_hash.number} '
                 )
+                if new_block_hash.number > 9500000:
+                    logger.info('remote={connection.session.remote} is ETC, kicking it')
+                    await connection.cancel()
         elif isinstance(cmd, NewBlock):
             block = cmd.payload.block  # payload is protocol.eth.payloads.NewBlockPayload
             logger.info(
@@ -678,6 +693,9 @@ async def process(connection, gethdb):
                 f'transactions={len(block.transactions)} '
                 f'uncles={len(block.uncles)}'
             )
+            if block.header.block_number > 9500000:
+                logger.info('remote={connection.session.remote} is ETC, kicking it')
+                await connection.cancel()
         else:
             logger.debug(f'unhandled ETH message {connection.session.remote}: {cmd}')
 
