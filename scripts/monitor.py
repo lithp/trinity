@@ -11,7 +11,6 @@ import struct
 import snappy
 import plyvel
 
-from sqlalchemy_aio import ASYNCIO_STRATEGY
 from sqlalchemy import (
     create_engine, MetaData, Table, Column, Integer, Text, DateTime,
 )
@@ -313,58 +312,58 @@ schema_version = Table(
 current_schema = 2
 
 
-async def does_table_exist(conn, table_name) -> bool:
-    return bool(await conn.scalar(
+def does_table_exist(conn, table_name) -> bool:
+    return bool(conn.scalar(
         f"SELECT name FROM sqlite_master WHERE type='table' AND name='{nodes.name}';"
     ))
 
 
-async def upgrade_schema(conn) -> None:
-    if await does_table_exist(conn, 'schema_version'):
-        reported_schema = await conn.scalar('SELECT version FROM schema_version;')
+def upgrade_schema(conn) -> None:
+    if does_table_exist(conn, 'schema_version'):
+        reported_schema = conn.scalar('SELECT version FROM schema_version;')
         if reported_schema == current_schema:
             return
 
-    await conn.execute('DROP TABLE IF EXISTS nodes;')
-    await conn.execute(CreateTable(nodes))
+    conn.execute('DROP TABLE IF EXISTS nodes;')
+    conn.execute(CreateTable(nodes))
 
-    await conn.execute('DROP TABLE IF EXISTS blacklist;')
-    await conn.execute(CreateTable(blacklist))
+    conn.execute('DROP TABLE IF EXISTS blacklist;')
+    conn.execute(CreateTable(blacklist))
 
-    await conn.execute('DROP TABLE IF EXISTS deferred;')
-    await conn.execute(CreateTable(deferred_nodes))
+    conn.execute('DROP TABLE IF EXISTS deferred;')
+    conn.execute(CreateTable(deferred_nodes))
 
-    await conn.execute('DROP TABLE IF EXISTS schema_version;')
-    await conn.execute(CreateTable(schema_version))
-    await conn.execute(f'INSERT INTO schema_version (version) VALUES ({current_schema});')
+    conn.execute('DROP TABLE IF EXISTS schema_version;')
+    conn.execute(CreateTable(schema_version))
+    conn.execute(f'INSERT INTO schema_version (version) VALUES ({current_schema});')
 
 
-async def blacklist_node(conn, remote, reason):
-    await conn.execute(blacklist.insert().values(
+def blacklist_node(conn, remote, reason):
+    conn.execute(blacklist.insert().values(
         enode=remote.uri(),
         reason=reason,
         add_time=datetime.datetime.now(),
     ))
 
 
-async def defer_node(conn, remote, reason, delay):
-    await conn.execute(deferred_nodes.insert().values(
+def defer_node(conn, remote, reason, delay):
+    conn.execute(deferred_nodes.insert().values(
         enode=remote.uri(),
         reason=reason,
         expire_time=datetime.datetime.now() + delay,
     ))
 
 
-async def should_connect(conn, node):
+def should_connect(conn, node):
     enode = node.uri()
 
-    res = await conn.execute(blacklist.select(blacklist.c.enode == enode))
-    f = await res.first()
+    res = conn.execute(blacklist.select(blacklist.c.enode == enode))
+    f = res.first()
     if f is not None:
         return False
 
-    res = await conn.execute(deferred_nodes.select(deferred_nodes.c.enode == enode))
-    f = await res.first()
+    res = conn.execute(deferred_nodes.select(deferred_nodes.c.enode == enode))
+    f = res.first()
     if f is not None:
         try:
             expire_time = f.expire_time
@@ -376,7 +375,7 @@ async def should_connect(conn, node):
             return False
 
         logger.debug(f'{node} was deferred but trying again. expire_time={f.expire_time} reason={f.reason}')
-        await conn.execute(
+        conn.execute(
             deferred_nodes.delete(deferred_nodes.c.enode == enode)
         )
 
@@ -419,12 +418,12 @@ async def feed_queue(candidate_enode_queue, enode_file_name):
 async def connect_from_queue(engine, candidate_enode_queue, peer_tracker, gethdb):
     tasks = []
 
-    conn = await engine.connect()
+    conn = engine.connect()
     try:
         while True:
             node = await candidate_enode_queue.get()
 
-            if await should_connect(conn, node):
+            if should_connect(conn, node):
                 connection = await connect(conn, node)
                 if connection:
                     task = asyncio.ensure_future(
@@ -439,7 +438,7 @@ async def connect_from_queue(engine, candidate_enode_queue, peer_tracker, gethdb
         raise
     finally:
         logger.info('connect_from_queue: cleaning up all tasks')
-        await conn.close()
+        conn.close()
         for (connection, task) in tasks:
             if not connection.is_cancelled:
                 await connection.cancel()
@@ -449,19 +448,19 @@ async def connect_from_queue(engine, candidate_enode_queue, peer_tracker, gethdb
 
 
 async def connect_all(enode_file_name, gethdb):
-    engine = create_engine('sqlite:///nodedb.sqlite', strategy=ASYNCIO_STRATEGY)
+    engine = create_engine('sqlite:///nodedb.sqlite')
 
     try:
         queue = asyncio.Queue(maxsize=10)
-        conn = await engine.connect()
-        await upgrade_schema(conn)
-        await conn.close()
+        conn = engine.connect()
+        upgrade_schema(conn)
+        conn.close()
 
         tracker = PeerCountTracker()
 
         feeder = asyncio.ensure_future(feed_queue(queue, enode_file_name))
         readers = []
-        for _ in range(20):
+        for _ in range(2):
             readers.append(
                 asyncio.ensure_future(connect_from_queue(engine, queue, tracker, gethdb))
             )
@@ -519,50 +518,50 @@ async def connect(conn, remote):
             timeout=5
         )
     except asyncio.TimeoutError:
-        await defer_node(conn, remote, 'TimeoutError', datetime.timedelta(hours=1))
+        defer_node(conn, remote, 'TimeoutError', datetime.timedelta(hours=1))
         logger.error(f'connecting timed out remote={remote}')
         return
     except WrongNetworkFailure as e:
-        await blacklist_node(conn, remote, 'WrongNetworkFailure')
+        blacklist_node(conn, remote, 'WrongNetworkFailure')
         logger.error(f'WrongNetworkFailure={e} remote={remote}')
         return
     except HandshakeFailureTooManyPeers:
-        await defer_node(conn, remote, 'TooManyPeers', datetime.timedelta(minutes=5))
+        defer_node(conn, remote, 'TooManyPeers', datetime.timedelta(minutes=5))
         logger.error(f'too many peers remote={remote}')
         return
     except NoMatchingPeerCapabilities as e:
-        await blacklist_node(conn, remote, 'NoMatchingPeerCapabilities')
+        blacklist_node(conn, remote, 'NoMatchingPeerCapabilities')
         logger.error(f'no matching caps: %s remote={remote}', e.remote_capabilities)
         return
     except UnreachablePeer:
-        await defer_node(conn, remote, 'UnreachablePeer', datetime.timedelta(days=1))
+        defer_node(conn, remote, 'UnreachablePeer', datetime.timedelta(days=1))
         logger.error(f'unreachable peer remote={remote}')
         return
     except WrongGenesisFailure as e:
-        await blacklist_node(conn, remote, 'WrongGenesisFailure')
+        blacklist_node(conn, remote, 'WrongGenesisFailure')
         logger.error(f'WrongGenesis: {e} remote={remote}')
         return
     except HandshakeFailure as e:
-        await defer_node(conn, remote, 'UnreachablePeer', datetime.timedelta(hours=2))
+        defer_node(conn, remote, 'UnreachablePeer', datetime.timedelta(hours=2))
         logger.error(f'handshake failure: {e} remote={remote}')
         return
     except PeerConnectionLost:
-        await defer_node(conn, remote, 'PeerConnectionLost', datetime.timedelta(hours=1))
+        defer_node(conn, remote, 'PeerConnectionLost', datetime.timedelta(hours=1))
         logger.error(f'peer connection lost remote={remote}')
         return
     except MalformedMessage:
-        await defer_node(conn, remote, 'MalformedMessage', datetime.timedelta(hours=1))
+        defer_node(conn, remote, 'MalformedMessage', datetime.timedelta(hours=1))
         logger.error(f'MalformedMessage remote={remote}')
         return
     except ConnectionResetError:
-        await defer_node(conn, remote, 'ConnectionResetError', datetime.timedelta(hours=1))
+        defer_node(conn, remote, 'ConnectionResetError', datetime.timedelta(hours=1))
         logger.error(f'ConnectionResetError remote={remote}')
         return
     except asyncio.CancelledError:
         logger.debug('connect was cancelled remote={remote}')
         raise
     except rlp.exceptions.DeserializationError:
-        await defer_node(conn, remote, 'DeserializationError', datetime.timedelta(hours=2))
+        defer_node(conn, remote, 'DeserializationError', datetime.timedelta(hours=2))
         logger.error(f'DeserializationError remote={remote}')
         return
     except Exception as e:
@@ -637,7 +636,7 @@ async def process(connection, gethdb):
             )
             # TODO: this read blocks the main thread. that's bad!
             header = gethdb.block_header(cmd.payload.block_number_or_hash)
-            eth_proto.send(BlockHeaders(tuple(header)))
+            eth_proto.send(BlockHeaders([header]))
         elif isinstance(cmd, GetNodeData):
             logger.info(f'{connection.session.remote} GetNodeData (sending empty response)')
             eth_proto.send(NodeData(tuple()))
@@ -647,7 +646,7 @@ async def process(connection, gethdb):
             eth_proto.send(BlockBodies(tuple()))
         elif isinstance(cmd, Transactions):
             random_id = os.urandom(4).hex()  # for easier log correlation
-            logger.info(f'{connection.session.remote} Transactions: {len(cmd.payload)} id={random_id}')
+            logger.info(f'{connection.session.remote} Transactions: count={len(cmd.payload)} id={random_id}')
             for txn in cmd.payload:
                 logger.info(
                     f'transaction received: '
@@ -700,8 +699,9 @@ async def process(connection, gethdb):
                 await connection.cancellation()  # end processing if we disconnect
             except OperationCancelled:
                 # cancelling the connection does not cancel the multiplexer...
-                if connection._multiplexer._multiplex_token is not None:
-                    connection._multiplexer._multiplex_token.trigger()
+                token = getattr(connection._multiplexer, '_multiplex_token', None)
+                if token is not None:
+                    token.trigger()
 
                 # this try:except: probably belongs inside Service.cancellation(), if
                 # we're waiting on cancellation then we probably don't want an exception
