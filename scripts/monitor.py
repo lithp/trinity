@@ -735,11 +735,14 @@ async def process(engine, connection, gethdb):
                 if new_block_hash.number > 9500000:
                     logger.info(f'remote={connection.session.remote} is ETC, kicking it')
                     blacklist_node(engine, connection.session.remote, 'BadBlockAnnouncement')
-                    await connection.cancel()
+                    # we must call cancel_nowait because we're currently inside the
+                    # request handler. If we tried to await cancellation then we'd wait
+                    # forever for ourselves to finish
+                    connection.cancel_nowait()
                 if new_block_hash.number < 8000000:
                     logger.info(f'remote={connection.session.remote} advertisement too low, kicking')
                     blacklist_node(engine, connection.session.remote, 'BadBlockAnnouncement')
-                    await connection.cancel()
+                    connection.cancel_nowait()
         elif isinstance(cmd, NewBlock):
             timeout.cancel()
             block = cmd.payload.block  # payload is protocol.eth.payloads.NewBlockPayload
@@ -756,14 +759,14 @@ async def process(engine, connection, gethdb):
             if block.header.block_number > 9500000:
                 logger.info(f'remote={connection.session.remote} is ETC, kicking it')
                 blacklist_node(engine, connection.session.remote, 'BadBlockAnnouncement')
-                await connection.cancel()
+                connection.cancel_nowait()
             if block.header.block_number < 8000000:
                 # There are ETH nodes, ETC nodes, and also nodes which seem to be doing
                 # their own thing in he blocknum=6M range? No idea who they are but kick
                 # them out so we can fit another ETH peer into the pool
                 logger.info(f'remote={connection.session.remote} advertisement too low, kicking')
                 blacklist_node(engine, connection.session.remote, 'BadBlockAnnouncement')
-                await connection.cancel()
+                connection.cancel_nowait()
         else:
             logger.debug(f'unhandled ETH message {connection.session.remote}: {cmd}')
 
