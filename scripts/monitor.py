@@ -633,10 +633,10 @@ async def process(engine, connection, gethdb):
     eth_proto = connection.get_protocol_by_type(ETHProtocol)
     max_header = gethdb.block_num_for_hash(gethdb.last_block_hash)
 
-    async def kick_node():
+    def kick_node():
         logger.info('remote={connection.session.remote} error=NeverAnnouncedBlock')
         blacklist_node(engine, connection.session.remote, 'NeverAnnouncedABlock')
-        await connection.cancel()
+        asyncio.create_task(connection.cancel())
 
     # If the node doesn't send us any block announcements within 2 minutes it probably
     # never will, disconnect and try to find a different node.
