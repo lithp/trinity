@@ -341,11 +341,16 @@ def upgrade_schema(conn) -> None:
 
 
 def blacklist_node(conn, remote, reason):
-    conn.execute(blacklist.insert().values(
-        enode=remote.uri(),
-        reason=reason,
-        add_time=datetime.datetime.now(),
-    ))
+    try:
+        conn.execute(blacklist.insert().values(
+            enode=remote.uri(),
+            reason=reason,
+            add_time=datetime.datetime.now(),
+        ))
+    except sqlalchemy.exc.IntegrityError as e:
+        if 'UNIQUE' not in e:
+            raise
+        logger.debug(f'remote={remote} err=AlreadyBlacklisted')
 
 
 def defer_node(conn, remote, reason, delay):
