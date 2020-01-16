@@ -9,7 +9,9 @@ import logging
 import os
 import struct
 import snappy
+import sys
 import plyvel
+import traceback
 
 from sqlalchemy import (
     create_engine, MetaData, Table, Column, Integer, Text, DateTime,
@@ -398,6 +400,40 @@ class PeerCountTracker:
             self.peer_disconnected_event.set()
             logger.info(f'disconnected. remote={remote} peer_count={self.peer_count}')
 
+    async def wait_until_allowed_to_connect(self):
+        while self.peer_count >= 80:
+            await self.peer_disconnected_event.wait()
+            if not self.peer_disconnected_event.is_set():
+                # another coro woke up before this one
+                continue
+            # this coro woke first, signal to the others that they're too late
+            self.peer_disconnected_event.clear()
+            break
+
+
+class ConnectedPeerTracker:
+    "TODO: merge this in with PeerCountTracker"
+
+    def __init__(self):
+        self.peers = set()
+
+    def can_connect(self, remote):
+        return not remote in self.peers
+
+    def connect(self, remote):
+        self.peers.add(remote)
+
+    def disconnect(self, remote):
+        self.peers.remove(remote)
+
+    @contextlib.contextmanager
+    def lock(self, remote):
+        self.connect(remote)
+        try:
+            yield
+        finally:
+            self.disconnect(remote)
+
 
 async def feed_queue(candidate_enode_queue, enode_file_name):
     """
@@ -417,29 +453,24 @@ async def feed_queue(candidate_enode_queue, enode_file_name):
         logger.info('ran out of candidates, running through the list again')
 
 
-async def connect_from_queue(engine, candidate_enode_queue, peer_tracker, gethdb):
+async def connect_from_queue(engine, candidate_enode_queue, peer_tracker, connect_tracker, gethdb):
     tasks = []
 
     conn = engine.connect()
     try:
         while True:
             # if we connect to too many remotes then the event loop gets bogged down
-            while peer_tracker.peer_count >= 80:
-                await peer_tracker.peer_disconnected_event.wait()
-                if not peer_tracker.peer_disconnected_event.is_set():
-                    # another coro woke up before this one
-                    continue
-                # this coro woke first, signal to the others that they're too late
-                peer_tracker.peer_disconnected_event.clear()
-                break
+            await peer_tracker.wait_until_allowed_to_connect()
 
             node = await candidate_enode_queue.get()
 
-            if should_connect(conn, node):
-                connection = await connect(conn, node)
+            if should_connect(conn, node) and connect_tracker.can_connect(node.uri()):
+                with connect_tracker.lock(node.uri()):
+                    connection = await connect(conn, node)
                 if connection:
+                    connect_tracker.connect(node.uri())
                     task = asyncio.ensure_future(
-                        process_with_tracking(connection, peer_tracker, gethdb)
+                        process_with_tracking(engine, connection, peer_tracker, connect_tracker, gethdb)
                     )
                     tasks.append((connection, task))
     except asyncio.CancelledError:
@@ -469,13 +500,14 @@ async def connect_all(enode_file_name, gethdb):
         conn.close()
 
         tracker = PeerCountTracker()
+        connect_tracker = ConnectedPeerTracker()
 
         feeder = asyncio.ensure_future(feed_queue(queue, enode_file_name))
         readers = []
         for _ in range(20):
-            readers.append(
-                asyncio.ensure_future(connect_from_queue(engine, queue, tracker, gethdb))
-            )
+            readers.append(asyncio.ensure_future(
+                connect_from_queue(engine, queue, tracker, connect_tracker, gethdb)
+            ))
 
         try:
             await asyncio.gather(*readers)
@@ -585,60 +617,77 @@ async def connect(conn, remote):
     return connection
 
 
-async def process_with_tracking(connection, peer_tracker, gethdb):
+async def process_with_tracking(engine, connection, peer_tracker, connect_tracker, gethdb):
     try:
         with peer_tracker.track(connection.session.remote):
-            await process(connection, gethdb)
+            await process(engine, connection, gethdb)
     except BaseException:
         logger.exception('exception during process_with_tracking')
         raise
+    finally:
+        enode = connection.session.remote.uri()
+        connect_tracker.disconnect(enode)
 
 
-async def process(connection, gethdb):
+async def process(engine, connection, gethdb):
     eth_proto = connection.get_protocol_by_type(ETHProtocol)
     max_header = gethdb.block_num_for_hash(gethdb.last_block_hash)
+
+    async def kick_node():
+        logger.info('remote={connection.session.remote} error=NeverAnnouncedBlock')
+        blacklist_node(engine, connection.session.remote, 'NeverAnnouncedABlock')
+        await connection.cancel()
+
+    # If the node doesn't send us any block announcements within 2 minutes it probably
+    # never will, disconnect and try to find a different node.
+    loop = asyncio.get_event_loop()
+    timeout = loop.call_later(delay=60, callback=kick_node)
 
     async def handle_eth_message(connection, cmd):
         if isinstance(cmd, GetBlockHeaders):
             if gethdb is None:
-                eth_proto.send(BlockHeaders(tuple()))
                 logger.info(
                     f'{connection.session.remote} '
                     f'GetBlockHeaders '
                     f'payload={cmd.payload} '
                     f'error=no-gethdb'
                 )
+                await asyncio.sleep(1)  # a short delay so syncing peers like us less
+                eth_proto.send(BlockHeaders(tuple()))
                 return
 
             if gethdb is None or cmd.payload.max_headers != 1:
                 # answer the checkpoint queries, don't help other peers sync
-                eth_proto.send(BlockHeaders(tuple()))
                 logger.info(
                     f'{connection.session.remote} '
                     f'GetBlockHeaders '
                     f'payload={cmd.payload} '
                     f'error=request-too-big'
                 )
+                await asyncio.sleep(1)  # a short delay so syncing peers like us less
+                eth_proto.send(BlockHeaders(tuple()))
                 return
 
             if not isinstance(cmd.payload.block_number_or_hash, int):
-                eth_proto.send(BlockHeaders(tuple()))
                 logger.info(
                     f'{connection.session.remote} '
                     f'GetBlockHeaders '
                     f'payload={cmd.payload} '
                     f'error=requested-header-by-hash'
                 )
+                await asyncio.sleep(1)  # a short delay so syncing peers like us less
+                eth_proto.send(BlockHeaders(tuple()))
                 return
 
             if cmd.payload.block_number_or_hash > max_header:
-                eth_proto.send(BlockHeaders(tuple()))
                 logger.info(
                     f'{connection.session.remote} '
                     f'GetBlockHeaders '
                     f'payload={cmd.payload} '
                     f'error=requested-header-too-recent'
                 )
+                await asyncio.sleep(1)  # a short delay so syncing peers like us less
+                eth_proto.send(BlockHeaders(tuple()))
                 return
 
             logger.info(
@@ -651,26 +700,31 @@ async def process(connection, gethdb):
             eth_proto.send(BlockHeaders([header]))
         elif isinstance(cmd, GetNodeData):
             logger.info(f'{connection.session.remote} GetNodeData (sending empty response)')
+            await asyncio.sleep(1)  # a short delay so syncing peers like us less
             eth_proto.send(NodeData(tuple()))
         elif isinstance(cmd, GetBlockBodies):
             humanized = [block_hash.hex() for block_hash in cmd.payload]
             logger.info(f'{connection.session.remote} GetBlockBodies: {humanized} (sending empty response)')
+            await asyncio.sleep(1)  # a short delay so syncing peers like us less
             eth_proto.send(BlockBodies(tuple()))
         elif isinstance(cmd, Transactions):
-            random_id = os.urandom(4).hex()  # for easier log correlation
-            logger.info(f'{connection.session.remote} Transactions: count={len(cmd.payload)} id={random_id}')
-            for txn in cmd.payload:
-                logger.info(
-                    f'transaction received: '
-                    f'remote={connection.session.remote} '
-                    f'len={len(rlp.encode(txn))} '
-                    f'hash={txn.hash.hex()} '
-                    f'id={random_id} '
-                )
+            pass
+#            random_id = os.urandom(4).hex()  # for easier log correlation
+#            logger.info(f'{connection.session.remote} Transactions: count={len(cmd.payload)} id={random_id}')
+#            for txn in cmd.payload:
+#                logger.info(
+#                    f'transaction received: '
+#                    f'remote={connection.session.remote} '
+#                    f'len={len(rlp.encode(txn))} '
+#                    f'hash={txn.hash.hex()} '
+#                    f'id={random_id} '
+#                )
+#            logger.info(f'{connection.session.remote} Transactions: count={len(cmd.payload)}')
 
-            if len(cmd.payload) == 0:
-                logger.info(f'{connection.session.remote} empty Transactions')
+#            if len(cmd.payload) == 0:
+#                logger.info(f'{connection.session.remote} empty Transactions')
         elif isinstance(cmd, NewBlockHashes):
+            timeout.cancel()
             for new_block_hash in cmd.payload:
                 logger.info(
                     f'NewBlockHashes: '
@@ -679,9 +733,15 @@ async def process(connection, gethdb):
                     f'blocknum={new_block_hash.number} '
                 )
                 if new_block_hash.number > 9500000:
-                    logger.info('remote={connection.session.remote} is ETC, kicking it')
+                    logger.info(f'remote={connection.session.remote} is ETC, kicking it')
+                    blacklist_node(engine, connection.session.remote, 'BadBlockAnnouncement')
+                    await connection.cancel()
+                if new_block_hash.number < 8000000:
+                    logger.info(f'remote={connection.session.remote} advertisement too low, kicking')
+                    blacklist_node(engine, connection.session.remote, 'BadBlockAnnouncement')
                     await connection.cancel()
         elif isinstance(cmd, NewBlock):
+            timeout.cancel()
             block = cmd.payload.block  # payload is protocol.eth.payloads.NewBlockPayload
             logger.info(
                 f'NewBlock: '
@@ -694,7 +754,15 @@ async def process(connection, gethdb):
                 f'uncles={len(block.uncles)}'
             )
             if block.header.block_number > 9500000:
-                logger.info('remote={connection.session.remote} is ETC, kicking it')
+                logger.info(f'remote={connection.session.remote} is ETC, kicking it')
+                blacklist_node(engine, connection.session.remote, 'BadBlockAnnouncement')
+                await connection.cancel()
+            if block.header.block_number < 8000000:
+                # There are ETH nodes, ETC nodes, and also nodes which seem to be doing
+                # their own thing in he blocknum=6M range? No idea who they are but kick
+                # them out so we can fit another ETH peer into the pool
+                logger.info(f'remote={connection.session.remote} advertisement too low, kicking')
+                blacklist_node(engine, connection.session.remote, 'BadBlockAnnouncement')
                 await connection.cancel()
         else:
             logger.debug(f'unhandled ETH message {connection.session.remote}: {cmd}')
@@ -725,6 +793,8 @@ async def process(connection, gethdb):
                 # we're waiting on cancellation then we probably don't want an exception
                 # to tell us it's been cancelled!
                 logger.debug('stopping because connection was cancelled')
+            finally:
+                timeout.cancel()
 
     return True
 
