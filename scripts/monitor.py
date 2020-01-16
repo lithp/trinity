@@ -376,7 +376,7 @@ def should_connect(conn, node):
         if expire_time > datetime.datetime.now():
             return False
 
-        logger.debug(f'{node} was deferred but trying again. expire_time={f.expire_time} reason={f.reason}')
+        #logger.debug(f'{node} was deferred but trying again. expire_time={f.expire_time} reason={f.reason}')
         conn.execute(
             deferred_nodes.delete(deferred_nodes.c.enode == enode)
         )
@@ -602,7 +602,7 @@ async def connect(conn, remote):
         logger.error(f'ConnectionResetError remote={remote}')
         return
     except asyncio.CancelledError:
-        logger.debug('connect was cancelled remote={remote}')
+        logger.debug(f'connect was cancelled remote={remote}')
         raise
     except rlp.exceptions.DeserializationError:
         defer_node(conn, remote, 'DeserializationError', datetime.timedelta(hours=2))
@@ -634,7 +634,7 @@ async def process(engine, connection, gethdb):
     max_header = gethdb.block_num_for_hash(gethdb.last_block_hash)
 
     def kick_node():
-        logger.info('remote={connection.session.remote} error=NeverAnnouncedBlock')
+        logger.info(f'remote={connection.session.remote} error=NeverAnnouncedBlock')
         blacklist_node(engine, connection.session.remote, 'NeverAnnouncedABlock')
         asyncio.create_task(connection.cancel())
 
