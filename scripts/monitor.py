@@ -14,7 +14,7 @@ import plyvel
 import traceback
 
 from sqlalchemy import (
-    create_engine, MetaData, Table, Column, Integer, Text, DateTime,
+    create_engine, MetaData, Table, Column, Integer, Text, DateTime, func
 )
 from sqlalchemy.schema import CreateTable, DropTable
 
@@ -30,6 +30,7 @@ from p2p import kademlia, ecies
 from p2p.auth import HandshakeInitiator, handshake
 from p2p.handshake import dial_out, DevP2PHandshakeParams
 from p2p.constants import DEVP2P_V5
+from p2p.disconnect import DisconnectReason
 from p2p.exceptions import (
     HandshakeFailure,
     HandshakeFailureTooManyPeers,
@@ -389,6 +390,28 @@ def should_connect(conn, node):
     return True
 
 
+def expired_deferred_nodes(conn):
+    """
+    Returns all nodes which were deferred but which are now available for a connection
+    attempt. Returns a list rather than a cursor because keeping the cursor open while we
+    switch to other coros seems like a bad idea
+    """
+    now = datetime.datetime.now()
+    res = conn.execute(deferred_nodes.select(deferred_nodes.c.expire_time < now))
+    return res.fetchall()
+
+
+def time_until_next_expiration(conn):
+    """
+    Returns how long we would have to sleep, if we wanted to wait until another node
+    became available for a connection attempt.
+    """
+    res = conn.execute(deferred_nodes.select(func.min(deferred_nodes.c.expire_time)))
+    expire_time = res.first()
+    now = datetime.datetime.now()
+    return max(0, (expire_time-now).total_seconds())
+
+
 class PeerCountTracker:
     def __init__(self):
         self.peer_count = 0
@@ -440,7 +463,7 @@ class ConnectedPeerTracker:
             self.disconnect(remote)
 
 
-async def feed_queue(candidate_enode_queue, enode_file_name):
+async def feed_queue(engine, candidate_enode_queue, enode_file_name, done_event):
     """
     More efficient then cycling through every node, looking for deferred ones which are
     ready to be tried again, would be to maintain some kind of priority queue with the
@@ -449,13 +472,76 @@ async def feed_queue(candidate_enode_queue, enode_file_name):
     future requirement that some other process can crawl the DHT and add candidates, it
     could add them to the database.
     """
+    with open(enode_file_name) as f:
+        for enode_line in f:
+            enode = enode_line.strip()
+            node = kademlia.Node.from_uri(enode)
+            await candidate_enode_queue.put(node)
+    logger.info('went through the entire list, now using nodes from the database')
+    done_event.set()
+
+    # TODO: fix this
     while True:
-        with open(enode_file_name) as f:
-            for enode_line in f:
-                enode = enode_line.strip()
-                node = kademlia.Node.from_uri(enode)
-                await candidate_enode_queue.put(node)
-        logger.info('ran out of candidates, running through the list again')
+        await asyncio.sleep(1000)
+
+    return
+
+    while True:
+        sleep_time = time_until_next_expiration(engine)
+        if sleep_time > 0:
+            logger.debug(f'waiting to retry connecting to deferred nodes secs={sleep_time}')
+        await asyncio.sleep(sleep_time)
+        deferred_nodes = expired_deferred_nodes(engine)
+        for deferred_node in deferred_nodes:
+            node = kademlia.Node.from_uri(deferred_node.enode)
+            await candidate_enode_queue.put(node)
+
+        await candidate_enode_queue.join()  # this probably needs a timeout
+
+
+
+async def queue_connect_candidates(candidate_enode_queue, done_event):
+    pass
+
+
+async def db_connect_candidates(engine):
+    pass
+
+
+async def connect_candidates(engine, candidate_enode_queue, done_event):
+    for node in queue_connect_candidates(candidate_enode_queue, done_event):
+        return node, True
+    assert done_event.is_set()
+    for node in db_connect_candidates(engine):
+        yield node, False
+
+
+async def next_node(engine, candidate_enode_queue, done_event):
+    if not done_event.is_set():
+        while True:
+            if done_event.is_set():
+                try:
+                    node = candidate_enode_queue.get_nowait()
+                except asyncio.Empty:
+                    # it's time to start reading from the database
+                    break
+
+            node = await candidate_enode_queue.get()
+            if should_connect(conn, node):
+                return node, True
+
+    while True:
+        sleep_time = time_until_next_expiration(engine)
+        if sleep_time > 0:
+            logger.debug(f'waiting to retry connecting to deferred nodes secs={sleep_time}')
+        await asyncio.sleep(sleep_time)
+        deferred_nodes = expired_deferred_nodes(engine)
+        for deferred_node in deferred_nodes:
+            node = kademlia.Node.from_uri(deferred_node.enode)
+            yield node
+
+    # read from the db
+
 
 
 async def connect_from_queue(engine, candidate_enode_queue, peer_tracker, connect_tracker, gethdb):
@@ -463,21 +549,33 @@ async def connect_from_queue(engine, candidate_enode_queue, peer_tracker, connec
 
     conn = engine.connect()
     try:
-        while True:
+        candidates = connect_candidates(engine, candidate_enode_queue, done_event)
+        async for node, from_queue in candidates:
             # if we connect to too many remotes then the event loop gets bogged down
+            try:
+                if connect_tracker.can_connect(node.uri()):
+                    with connect_tracker.lock(node.uri()):
+                        connection = await connect(conn, node)
+                    if connection:
+                        connect_tracker.connect(node.uri())
+                        task = asyncio.ensure_future(
+                            process_with_tracking(engine, connection, peer_tracker, connect_tracker, gethdb)
+                        )
+                        tasks.append((connection, task))
+            finally:
+                if from_queue:
+                    candidate_enode_queue.task_done()
+
             await peer_tracker.wait_until_allowed_to_connect()
 
-            node = await candidate_enode_queue.get()
+#            if should_connect(conn, node):
+#                connection = await connect(conn, node)
+#                if connection:
+#                    task = asyncio.ensure_future(
+#                        process_with_tracking(engine, connection, peer_tracker, connect_tracker, gethdb)
+#                    )
+#                    tasks.append((connection, task))
 
-            if should_connect(conn, node) and connect_tracker.can_connect(node.uri()):
-                with connect_tracker.lock(node.uri()):
-                    connection = await connect(conn, node)
-                if connection:
-                    connect_tracker.connect(node.uri())
-                    task = asyncio.ensure_future(
-                        process_with_tracking(engine, connection, peer_tracker, connect_tracker, gethdb)
-                    )
-                    tasks.append((connection, task))
     except asyncio.CancelledError:
         logger.info('connect_from_queue: cancelled')
         raise
@@ -499,7 +597,7 @@ async def connect_all(enode_file_name, gethdb):
     engine = create_engine('sqlite:///nodedb.sqlite')
 
     try:
-        queue = asyncio.Queue(maxsize=10)
+        candidate_enode_queue = asyncio.Queue(maxsize=1)
         conn = engine.connect()
         upgrade_schema(conn)
         conn.close()
@@ -507,11 +605,11 @@ async def connect_all(enode_file_name, gethdb):
         tracker = PeerCountTracker()
         connect_tracker = ConnectedPeerTracker()
 
-        feeder = asyncio.ensure_future(feed_queue(queue, enode_file_name))
+        feeder = asyncio.ensure_future(feed_queue(engine, candidate_enode_queue, enode_file_name))
         readers = []
         for _ in range(20):
             readers.append(asyncio.ensure_future(
-                connect_from_queue(engine, queue, tracker, connect_tracker, gethdb)
+                connect_from_queue(engine, candidate_enode_queue, tracker, connect_tracker, gethdb)
             ))
 
         try:
@@ -607,7 +705,7 @@ async def connect(conn, remote):
         logger.error(f'ConnectionResetError remote={remote}')
         return
     except asyncio.CancelledError:
-        logger.debug(f'connect was cancelled remote={remote}')
+        logger.exception(f'connect was cancelled remote={remote}')
         raise
     except rlp.exceptions.DeserializationError:
         defer_node(conn, remote, 'DeserializationError', datetime.timedelta(hours=2))
@@ -778,6 +876,11 @@ async def process(engine, connection, gethdb):
     async def handle_p2p_message(connection, cmd):
         if isinstance(cmd, Disconnect):
             logger.info(f'{connection.session.remote} disconnected reason={cmd.payload}')
+            if cmd.payload == DisconnectReason.USELESS_PEER:
+                defer_node(
+                    engine, connection.session.remote, 'WeAreUseless',
+                    datetime.timedelta(minutes=20)
+                )
         elif isinstance(cmd, Ping):
             logger.info(f'{connection.session.remote} ping, (sending pong)')
         else:

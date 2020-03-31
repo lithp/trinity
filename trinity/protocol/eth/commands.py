@@ -137,7 +137,10 @@ class NewBlock(BaseCommand[NewBlockPayload]):
     )
 
 
-GET_NODE_DATA_STRUCTURE = sedes.CountableList(hash_sedes)
+GET_NODE_DATA_STRUCTURE = sedes.List((
+    sedes.big_endian_int,
+    sedes.CountableList(hash_sedes)
+))
 
 
 class GetNodeData(BaseCommand[Tuple[Hash32, ...]]):
